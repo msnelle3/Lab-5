@@ -1,0 +1,269 @@
+---
+title: "Lab5"
+author: "Max Snellenberger"
+date: "2025-05-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+Lab 2 Task
+```{r}
+library(tidyverse)
+library(sf)
+library(tmap)
+library(leaflet)
+library(dplyr)
+library(spdep)
+library(ggplot2)
+
+# counties <- sf::read_sf("../data/CBW/County_Boundaries.shp")
+# counties %>% sf::st_make_valid()
+
+#load datasets
+counties <- sf::read_sf("../data/CBW/County_Boundaries.shp") %>% 
+  sf::st_make_valid()
+dams <- sf::read_sf("../data/CBW/Dam_or_Other_Blockage_Removed_2012_2017.shp") %>% 
+  sf::st_make_valid()
+streams <- sf::read_sf("../data/CBW/Streams_Opened_by_Dam_Removal_2012_2017.shp") %>% 
+  sf::st_make_valid()
+
+# aspatial
+bmps <- read_csv("../data/CBW/BMPreport2016_landbmps.csv")
+```
+
+```{r}
+#add a column for the combined state and county fips in counties
+counties <- counties %>% mutate(., FullFIPS = paste0(STATEFP10, COUNTYFP10))
+
+#create a column for trimmed fips in bmps
+bmps <-  bmps %>% mutate(., FIPS.trimmed = substr(GeographyName, 1, 5))
+
+#add bmps within each county
+summed_bmps <- bmps %>%
+  group_by(FIPS.trimmed) %>%
+  summarise(AmountCredited = sum(AmountCredited, na.rm = TRUE))
+summed_bmps
+
+#join both datasets by fips
+CountyBMP <- right_join(counties, summed_bmps, by = c("FullFIPS" = "FIPS.trimmed" ))
+glimpse(CountyBMP)
+#remove any values that are NA
+CountyBMP <- CountyBMP %>%
+  filter(!is.na(AmountCredited))
+
+# Remove rows with missing geometries
+CountyBMP <- CountyBMP[!is.na(st_geometry(CountyBMP)), ]
+
+# #make the map
+# tm_shape(CountyBMP) + 
+#   tm_polygons(fill = "AmountCredited")
+
+CountyBMP
+
+palette <- colorBin(palette = "YlGnBu", 
+                    domain = CountyBMP$AmountCredited,
+                    bins = 5)
+
+leaflet(data = CountyBMP) %>%
+  addProviderTiles("CartoDB.Positron") %>%  #Add basemap
+  addPolygons(
+    fillColor = ~palette(AmountCredited),
+    fillOpacity = .9,
+    color = "white",
+    weight = 1,
+    label = ~paste0(
+  NAME10, ": $", formatC(AmountCredited, format = "f", digits = 0, big.mark = ",")
+) %>% lapply(htmltools::HTML)
+) %>%
+  addLegend(pal = palette, values = ~AmountCredited
+  )
+```
+
+Lab 3
+```{r}
+NEprojected <- read_sf("./NortheastStates.shp")
+
+# Ensure NEprojected is in sf format
+NEprojected_sf <- st_as_sf(NEprojected)
+
+# Transform to WGS84 (lat/lon) for use with Leaflet
+NEprojected <- st_transform(NEprojected_sf, crs = 4326)
+
+# Ensure NEprojected is in sf format
+NEprojected_sf <- st_as_sf(NEprojected)
+
+# Check the class and structure of the sf object
+print(class(NEprojected_sf))  # Should be "sf"
+str(NEprojected_sf)
+
+NEnb <- spdep::poly2nb(NEprojected, queen = TRUE)
+
+pts <- st_centroid(NEprojected)
+
+IDWlw <- nb2listwdist(NEnb, as(pts, "Spatial"), style = "W", zero.policy = TRUE)
+IDWlw$weights[1]
+
+# Ensure the lisa_quadrant column exists and is correct
+table(NEprojected_sf$lisa_quadrant)
+
+# Define a color palette for the LISA quadrants
+color_palette <- colorFactor(
+  palette = c("red", "blue", "yellow", "green"), 
+  domain = NEprojected_sf$lisa_quadrant
+)
+
+# Calculate Local Moran's I for each observation
+local_moran <- localmoran(NEprojected$B01001e10, IDWlw)
+
+# Add the Local Moran's I results to your dataset
+NEprojected$local_moran_i <- local_moran[, 1]
+NEprojected$p_value <- local_moran[, 5]
+mean_observed <- mean(NEprojected$B01001e10)
+# Create LISA quadrant classification
+NEprojected$lisa_quadrant <- ifelse(NEprojected$local_moran_i > 0 & NEprojected$B01001e10 > mean_observed, "High-High",
+                                    ifelse(NEprojected$local_moran_i > 0 & NEprojected$B01001e10 < mean_observed, "Low-Low", 
+                                           ifelse(NEprojected$local_moran_i < 0 & NEprojected$B01001e10 > mean_observed, "High-Low", 
+                                                  "Low-High")))
+
+
+# Create the interactive leaflet map
+leaflet(data = NEprojected_sf) %>%
+  addProviderTiles("CartoDB.Positron", group = "CartoDB Positron") %>%
+  addTiles(group = "OpenStreetMap") %>%
+  addProviderTiles("Esri.WorldImagery", group = "Esri Satellite") %>%
+
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(
+    fillColor = ~color_palette(lisa_quadrant),  # Map colors to LISA quadrants
+    color = "black",  # Border color
+    weight = 1,  # Border weight
+    opacity = 1,  # Border opacity
+    fillOpacity = 0.7,  # Fill opacity
+    popup = ~paste0("<strong>LISA Quadrant:</strong> ", lisa_quadrant,
+                    "<br><strong>p-value:</strong> ", round(p_value, 4)),
+     highlight = highlightOptions(
+      weight = 3,
+      color = "white",
+      fillOpacity = 0.7,
+      bringToFront = TRUE
+    )
+  ) %>%
+  addLegend(
+    position = "bottomright",
+    pal = color_palette,
+    values = NEprojected_sf$lisa_quadrant,
+    title = "LISA Quadrants",
+    opacity = 1
+  ) %>%
+  addLayersControl(
+    baseGroups = c("CartoDB Positron", "OpenStreetMap", "Esri Satellite"),,
+    options = layersControlOptions(collapsed = FALSE)
+  )
+
+
+```
+
+```{r}
+state <- read_sf("./static_mapping/oh_counties.gpkg")
+labels <- read_sf("./static_mapping/oh_places.gpkg")
+parks <-  read_sf("./static_mapping/oh_parks.gpkg")
+rivers <- read_sf("./static_mapping/oh_rivers.gpkg")
+
+local <- read_sf("./static_mapping/oh_counties.gpkg") %>%
+  dplyr::filter(NAME %in% c("Portage", "Summit"))
+oh_region <-  st_bbox(local) %>%
+  st_as_sfc()
+
+local.map <- tm_shape(state, bbox = oh_region) + 
+  tm_borders() +
+  tm_shape(labels) + 
+  tm_fill(fill_alpha = 0.5) + 
+  tm_labels("NAME", size = 0.5) +
+  tm_shape(parks) + 
+  tm_polygons(fill = "FEATTYPE", fill_alpha = .5, palette = "brewer.greens") +    
+  tm_shape(rivers) + tm_lines(col = "blue")
+  
+local.map
+```
+```{r}
+# Reproject all layers to WGS84
+state_wgs <- st_transform(state, 4326)
+labels_wgs <- st_transform(labels, 4326)
+parks_wgs <- st_transform(parks, 4326)
+rivers_wgs <- st_transform(rivers, 4326)
+local_wgs <-  st_transform(local, 4326)
+
+#crop
+state_crop <- st_intersection(state_wgs, local_wgs)
+labels_crop <- st_intersection(labels_wgs, local_wgs)
+parks_crop <- st_intersection(parks_wgs, local_wgs)
+rivers_crop <- st_intersection(rivers_wgs, local_wgs)
+
+# #define centroids for labels
+#labels_centroids <- st_centroid(labels_crop)
+
+# Create a color palette for parks by FEATTYPE
+feattypes <- unique(parks$FEATTYPE)
+park_pal <- colorFactor("Greens", domain = feattypes)
+
+# Leaflet map
+leaflet() %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  
+  # Counties borders
+  addPolygons(
+    data = local_wgs,
+    fill = FALSE,
+    color = "black",
+    weight = 1,
+    group = "County Borders"
+  ) %>%
+  
+  # Parks with fill by FEATTYPE
+  addPolygons(
+    data = parks_crop,
+    fillColor = ~park_pal(FEATTYPE),
+    fillOpacity = 0.5,
+    color = "darkgreen",
+    weight = 0.5,
+    group = "Parks",
+    popup = ~paste("Park Type:", FEATTYPE)
+  ) %>%
+  
+  # Rivers
+  addPolylines(
+    data = rivers_crop,
+    color = "blue",
+    weight = 1,
+    group = "Rivers"
+  ) %>%
+#   
+#   # Place labels
+#   addLabelOnlyMarkers(
+#   data = labels_crop,
+#   label = ~NAME,
+#   labelOptions = labelOptions(noHide = TRUE, textsize = "10px"),
+#   group = "Place Labels"
+# )
+  
+  # # Add Layers Control
+  # addLayersControl(
+  #   overlayGroups = c("County Borders", "Parks", "Rivers", "Place Labels"),
+  #   options = layersControlOptions(collapsed = FALSE)
+  # ) %>%
+  # 
+  # # Zoom to bounding box
+  # fitBounds(
+  #   lng1 = st_bbox(oh_region)$xmin,
+  #   lat1 = st_bbox(oh_region)$ymin,
+  #   lng2 = st_bbox(oh_region)$xmax,
+  #   lat2 = st_bbox(oh_region)$ymax
+  # )
+
+```
+Questions
+1. I thought the labs this semester were very challenging but helpful to learn how to use R and to learn more about spatial analysis. I learned how to break projects down into steps to make them more achievable when the problem is too large to tackle all at once. I liked how the labs were challenging problems, and I wish that I had been able to put more time and effor into them this semester.
